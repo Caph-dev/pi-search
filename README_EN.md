@@ -73,6 +73,8 @@ export SEARCH_API_KEY="your-api-key"
 export SEARCH_API_PROTOCOL="completions"  # completions | responses (openai-completions / openai-responses)
 export SEARCH_MODEL="your-search-model"
 export SEARCH_THINKING_LEVEL="off"  # off | minimal | low | medium | high | xhigh | max
+export SEARCH_TIMEOUT_MS="120000"  # Total search budget, including retries and response reads
+export SEARCH_ENRICHMENT_TIMEOUT_MS="8000" # Supplemental budget, starts alongside main search
 
 # Tavily (optional, improves web_fetch and provides web_map)
 export TAVILY_API_KEY="tvly-your-key"
@@ -188,6 +190,26 @@ Common parameters:
   "max_output_bytes": 12000
 }
 ```
+
+### Search Latency and Timeouts
+
+Inspired by [smartsearch](https://github.com/konbakuyomu/smartsearch)'s shared deadline, main search and supplemental providers run concurrently:
+
+- `search` has a 120-second total budget, adjustable through `timeout_ms` or `SEARCH_TIMEOUT_MS`.
+- Supplemental Context7, Exa, Tavily, and Firecrawl requests have an 8-second budget starting alongside main search. Set `enrichment_timeout_ms` or `SEARCH_ENRICHMENT_TIMEOUT_MS` to adjust it, capped by the total budget. Slower supplemental results may be omitted; explicit `docs_search` is not subject to this 8-second cap.
+- Completed provider results survive supplemental timeouts. `details.partial_success` indicates failed attempts; cancellation and timeout interrupt retry waits immediately.
+- Per-call `model` overrides go directly to the API without a model-list preflight. Interactive model selection still uses the model list.
+- SSE reading finishes at `[DONE]` or Responses `response.completed` without waiting for the connection to close.
+- `details.latency_ms` reports total call latency, while `provider_attempts` keeps per-provider latency. Search answers are always fetched live; no answer cache was added.
+- `docs_search` runs Context7 and Exa in parallel when both are selected, preserving Context7-first source ordering. It reuses existing Context7 resolve/document TTL caches, accepts `force_refresh: true`, and skips resolution when `library_id` is supplied.
+
+```bash
+npm test
+npm run typecheck
+npm run bench
+```
+
+Benchmarks use controlled mock-provider delays, do not call paid APIs, and do not predict real-world network or model speedups.
 
 ## Search Quality Guidelines
 

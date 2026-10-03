@@ -108,6 +108,11 @@ const ENV_KEYS = [
 	"CONTEXT7_DOCS_TTL_HOURS",
 	"PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS",
 	"PI_SEARCH_DEFERRED_TOOLS",
+	"SEARCH_TIMEOUT_MS",
+	"SEARCH_ENRICHMENT_TIMEOUT_MS",
+	"SEARCH_RETRY_MAX_ATTEMPTS",
+	"SEARCH_RETRY_MAX_WAIT",
+	"SEARCH_RETRY_MULTIPLIER",
 ];
 
 const originalFetch = globalThis.fetch;
@@ -157,10 +162,11 @@ async function runTool(
 	name: string,
 	params: Record<string, unknown>,
 	ctx: ToolContext = testContext(),
+	signal?: AbortSignal,
 ): Promise<ToolResult> {
 	const tool = pi.tools.get(name);
 	expect(tool, `tool ${name} should be registered`).toBeDefined();
-	return await tool!.execute("test-call", params, undefined, undefined, ctx) as ToolResult;
+	return await tool!.execute("test-call", params, signal, undefined, ctx) as ToolResult;
 }
 
 beforeEach(() => {
@@ -642,6 +648,275 @@ describe("pi-search extension", () => {
 			format: "full",
 		});
 		expect(sources.content[0]?.text).toContain("React official docs");
+	});
+
+	it("should_start_exa_in_parallel_when_context7_is_pending", async () => {
+		process.env.EXA_API_KEY = "exa-test";
+		const calls: string[] = [];
+		let releaseContext7!: () => void;
+		const pending = new Promise<void>((resolve) => { releaseContext7 = resolve; });
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			calls.push(url);
+			if (url.startsWith("https://context7.test/api/v2/search")) {
+				await pending;
+				return jsonResponse({ results: [] });
+			}
+			return jsonResponse({ results: [{ url: "https://example.com/docs" }] });
+		}) as typeof fetch;
+
+		const result = runTool(installExtension(), "docs_search", { query: "parallel docs", provider: "all" });
+		await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0));
+		try {
+			expect(calls).toContain("https://exa.test/search");
+		} finally {
+			releaseContext7();
+			await result;
+		}
+	});
+
+	it("should_reuse_context7_cache_when_docs_search_is_repeated", async () => {
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			return url.includes("/api/v2/search")
+				? jsonResponse({ results: [{ id: "/react/react", title: "React" }] })
+				: jsonResponse({ codeSnippets: [{ content: "cached docs" }] });
+		}) as typeof fetch;
+		const pi = installExtension();
+		const params = { query: "React API", provider: "context7" };
+
+		await runTool(pi, "docs_search", params);
+		const second = await runTool(pi, "docs_search", params);
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+		expect(second.content[0]?.text).toContain("cached docs");
+		expect(second.details?.providers_used).toContain("context7_cache");
+	});
+
+	it("should_skip_model_listing_when_search_overrides_model", async () => {
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			return url.endsWith("/models")
+				? jsonResponse({ data: [{ id: "override-model" }] })
+				: textResponse('data: {"choices":[{"delta":{"content":"Override answer"}}]}\n\ndata: [DONE]\n');
+		}) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", {
+			query: "model override", model: "override-model", max_sources: 0,
+		});
+
+		expect(result.details?.model).toBe("override-model");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(globalThis.fetch).toHaveBeenCalledWith("https://search.test/v1/chat/completions", expect.anything());
+	});
+
+	it.each(["completions", "responses"])("should_finish_stream_when_%s_terminal_event_arrives", async (protocol) => {
+		process.env.SEARCH_API_PROTOCOL = protocol;
+		let releaseStream!: () => void;
+		const cancel = vi.fn();
+		const terminal = protocol === "responses"
+			? 'data: {"type":"response.completed","response":{"output_text":"Terminal answer"}}\n\n'
+			: 'data: {"choices":[{"delta":{"content":"Terminal answer"}}]}\n\ndata: [DONE]\n\n';
+		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(terminal));
+				releaseStream = () => controller.close();
+			},
+			cancel,
+		}))) as typeof fetch;
+		let finished = false;
+		const result = runTool(installExtension(), "search", { query: "stream completion", max_sources: 0 });
+		void result.then(() => { finished = true; });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const finishedBeforeClose = finished;
+		if (!finished) releaseStream();
+		const output = await result;
+
+		expect(finishedBeforeClose).toBe(true);
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(output.content[0]?.text).toContain("Terminal answer");
+	});
+
+	it("should_stop_retry_wait_when_search_is_cancelled", async () => {
+		const controller = new AbortController();
+		process.env.SEARCH_RETRY_MULTIPLIER = "1";
+		globalThis.fetch = vi.fn(async () => {
+			setTimeout(() => controller.abort(), 10);
+			return new Response("busy", { status: 429, headers: { "Retry-After": "0.15" } });
+		}) as typeof fetch;
+		const startedAt = performance.now();
+		const result = runTool(installExtension(), "search", { query: "cancel retry", max_sources: 0 }, testContext(), controller.signal);
+		await expect(result).rejects.toThrow();
+
+		expect(performance.now() - startedAt).toBeLessThan(100);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("should_keep_primary_answer_when_enrichment_exceeds_its_budget", async () => {
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			if (String(input).includes("/chat/completions")) {
+				return textResponse('data: {"choices":[{"delta":{"content":"Fast primary answer"}}]}\n\ndata: [DONE]\n');
+			}
+			await new Promise((_, reject) => {
+				const timer = setTimeout(() => reject(new Error("slow enrichment")), 250);
+				init?.signal?.addEventListener("abort", () => {
+					clearTimeout(timer);
+					reject(init.signal?.reason);
+				}, { once: true });
+			});
+			return jsonResponse({ results: [] });
+		}) as typeof fetch;
+		const startedAt = performance.now();
+
+		const result = await runTool(installExtension(), "search", {
+			query: "React API", enrichment_timeout_ms: 30,
+		});
+
+		expect(performance.now() - startedAt).toBeLessThan(150);
+		expect(result.content[0]?.text).toContain("Fast primary answer");
+		expect(result.details?.partial_success).toBe(true);
+		expect(result.details?.provider_attempts).toEqual(expect.arrayContaining([
+			expect.objectContaining({ provider: "context7", ok: false }),
+		]));
+	});
+
+	it("should_preserve_completed_docs_provider_when_another_times_out", async () => {
+		process.env.EXA_API_KEY = "exa-test";
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/chat/completions")) return jsonResponse({ choices: [{ message: { content: "Primary answer" } }] });
+			if (url.includes("/api/v2/search")) return jsonResponse({ results: [{ id: "/react/react", title: "React" }] });
+			await new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }));
+			return jsonResponse({ results: [] });
+		}) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", { query: "React API", enrichment_timeout_ms: 30 });
+
+		expect(result.content[0]?.text).toContain("Primary answer");
+		expect(result.details?.docs_search_enriched).toBe(true);
+		expect(result.details?.partial_success).toBe(true);
+		expect(result.details?.extra_sources).toEqual(expect.arrayContaining([
+			expect.objectContaining({ url: "https://context7.test/react/react" }),
+		]));
+	});
+
+	it("should_skip_context7_resolution_when_docs_library_id_is_provided", async () => {
+		globalThis.fetch = vi.fn(async () => jsonResponse({ codeSnippets: [{ content: "direct docs" }] })) as typeof fetch;
+		const pi = installExtension();
+		const params = { query: "React API", provider: "context7", library_id: "/react/react" };
+
+		const first = await runTool(pi, "docs_search", params);
+		await runTool(pi, "docs_search", params);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(first.details?.sources_count).toBe(1);
+		await runTool(pi, "docs_search", { ...params, force_refresh: true });
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it("should_reuse_resolve_cache_when_search_enrichment_is_repeated", async () => {
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => String(input).includes("/api/v2/search")
+			? jsonResponse({ results: [{ id: "/react/react", title: "React" }] })
+			: jsonResponse({ choices: [{ message: { content: "Live answer" } }] })) as typeof fetch;
+		const pi = installExtension();
+
+		await runTool(pi, "search", { query: "React API" });
+		const second = await runTool(pi, "search", { query: "React API" });
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+		expect(second.content[0]?.text).toContain("Live answer");
+		expect(second.details?.docs_search_enriched).toBe(true);
+		expect(second.details?.providers_used).toContain("context7_cache");
+	});
+
+	it("should_stop_main_request_when_total_search_budget_expires", async () => {
+		globalThis.fetch = vi.fn(async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			await new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }));
+			return jsonResponse({});
+		}) as typeof fetch;
+		const startedAt = performance.now();
+
+		await expect(runTool(installExtension(), "search", { query: "total timeout", max_sources: 0, timeout_ms: 30 })).rejects.toThrow();
+
+		expect(performance.now() - startedAt).toBeLessThan(150);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["completions", "responses"])("should_parse_%s_delta_when_stream_ends_without_newline", async (protocol) => {
+		process.env.SEARCH_API_PROTOCOL = protocol;
+		const data = protocol === "responses"
+			? { type: "response.output_text.delta", delta: "尾部内容" }
+			: { choices: [{ delta: { content: "尾部内容" } }] };
+		const bytes = new TextEncoder().encode(`data: ${JSON.stringify(data)}`);
+		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({
+			start(controller) {
+				for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+				controller.close();
+			},
+		}))) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", { query: "trailing delta", max_sources: 0 });
+
+		expect(result.content[0]?.text).toContain("尾部内容");
+	});
+
+	it("should_retry_rate_limit_when_search_budget_remains", async () => {
+		let calls = 0;
+		globalThis.fetch = vi.fn(async () => ++calls === 1
+			? new Response("busy", { status: 429, headers: { "Retry-After": "0" } })
+			: jsonResponse({ choices: [{ message: { content: "Retried answer" } }] })) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", { query: "retry", max_sources: 0 });
+
+		expect(calls).toBe(2);
+		expect(result.content[0]?.text).toContain("Retried answer");
+	});
+
+	it("should_leave_model_validation_to_api_when_override_is_invalid", async () => {
+		globalThis.fetch = vi.fn(async () => new Response("unknown model", { status: 400 })) as typeof fetch;
+
+		await expect(runTool(installExtension(), "search", {
+			query: "invalid model", model: "invalid", max_sources: 0,
+		})).rejects.toThrow("HTTP 400");
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("should_keep_exa_disabled_when_fallback_is_off_and_context7_has_results", async () => {
+		process.env.EXA_API_KEY = "exa-test";
+		process.env.SEARCH_FALLBACK_MODE = "off";
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => String(input).includes("/api/v2/search")
+			? jsonResponse({ results: [{ id: "/react/react", title: "React" }] })
+			: jsonResponse({ codeSnippets: [{ content: "Docs" }] })) as typeof fetch;
+
+		const result = await runTool(installExtension(), "docs_search", { query: "React API" });
+
+		expect(result.details?.providers_used).not.toContain("exa");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it("should_keep_completed_sources_when_primary_search_times_out", async () => {
+		globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			if (String(input).includes("/api/v2/search")) return jsonResponse({ results: [{ id: "/react/react", title: "React" }] });
+			await new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }));
+			return jsonResponse({});
+		}) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", { query: "React API", timeout_ms: 30 });
+
+		expect(result.details?.sources_count).toBe(1);
+		expect(result.details?.partial_success).toBe(true);
+		expect(result.content[0]?.text).toContain("仅返回补充信源");
+	});
+
+	it("should_ignore_non_object_events_when_search_stream_contains_malformed_data", async () => {
+		globalThis.fetch = vi.fn(async () => textResponse([
+			"data: null", "data: malformed", "data: []",
+			'data: {"choices":[{"delta":{"content":"Valid answer"}}]}', "data: [DONE]", "",
+		].join("\n"))) as typeof fetch;
+
+		const result = await runTool(installExtension(), "search", { query: "malformed events", max_sources: 0 });
+
+		expect(result.content[0]?.text).toContain("Valid answer");
 	});
 
 	it("records web_map provider diagnostics", async () => {

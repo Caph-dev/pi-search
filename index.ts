@@ -34,6 +34,7 @@ import { appendFile, readFile, writeFile, mkdir, readdir } from "node:fs/promise
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 type DefuddleExtractFn = (
 	input: Document | string | {
@@ -1416,6 +1417,7 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 const DEFAULT_MAX_OUTPUT_LINES = 800;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_ENRICHMENT_TIMEOUT_MS = 8_000;
 const SMART_DIRECT_DEFAULT_BROWSER = "chrome_145";
 const SMART_DIRECT_DEFAULT_OS = "windows";
 const SMART_DIRECT_DEFAULT_TIMEOUT_MS = 15_000;
@@ -1690,7 +1692,7 @@ function exponentialBackoffMs(attempt: number, maxWaitMs: number, multiplierMs: 
 }
 
 function isRetryableError(error: Error): boolean {
-	if (error.name === "AbortError") return false;
+	if (error.name === "AbortError" || error.name === "TimeoutError") return false;
 	if (error instanceof HttpStatusError) return RETRYABLE_STATUS.has(error.status);
 	return true;
 }
@@ -1706,6 +1708,7 @@ async function fetchWithRetry(
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		try {
+			init.signal?.throwIfAborted();
 			await debugLog("request.start", { url, attempt: attempt + 1, maxRetries });
 			const response = await fetch(url, init);
 
@@ -1731,7 +1734,7 @@ async function fetchWithRetry(
 						status: response.status,
 						waitMs,
 					});
-					await sleep(waitMs);
+					await sleep(waitMs, undefined, { signal: init.signal ?? undefined });
 					continue;
 				}
 				await debugLog("request.error", { url, status: response.status, body: text.slice(0, 300) });
@@ -1747,7 +1750,7 @@ async function fetchWithRetry(
 			return response;
 		} catch (e) {
 			lastError = e instanceof Error ? e : new Error(String(e));
-			if (!isRetryableError(lastError) || attempt >= maxRetries) {
+			if (init.signal?.aborted || !isRetryableError(lastError) || attempt >= maxRetries) {
 				await debugLog("request.failed", {
 					url,
 					attempt: attempt + 1,
@@ -1766,15 +1769,11 @@ async function fetchWithRetry(
 				error: lastError.message,
 				waitMs,
 			});
-			await sleep(waitMs);
+			await sleep(waitMs, undefined, { signal: init.signal ?? undefined });
 		}
 	}
 
 	throw lastError || new Error("Request failed");
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((r) => setTimeout(r, ms));
 }
 
 function abortSignalAny(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
@@ -2524,7 +2523,7 @@ async function searchWithModel(
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(payload),
-			signal,
+			signal: signal ?? createTimeoutSignal(normalizePositiveNumber(process.env.SEARCH_TIMEOUT_MS, undefined, DEFAULT_REQUEST_TIMEOUT_MS)),
 		},
 	);
 
@@ -2599,6 +2598,32 @@ async function parseSearchStreamResponse(
 	let buffer = "";
 	const rawLines: string[] = [];
 
+	const parseLine = (line: string): boolean => {
+		const trimmed = line.trim();
+		if (!trimmed) return false;
+		rawLines.push(trimmed);
+		if (!trimmed.startsWith("data:")) return false;
+		const payload = trimmed.slice(5).trim();
+		if (payload === "[DONE]") return true;
+		let data: Record<string, unknown>;
+		try {
+			const parsed: unknown = JSON.parse(payload);
+			if (!isRecord(parsed)) return false;
+			data = parsed;
+		} catch {
+			return false;
+		}
+		const chunk = protocol === "responses"
+			? extractResponsesDeltaText(data)
+			: extractCompletionsDeltaText(data);
+		if (chunk) content += chunk;
+		if (protocol === "responses" && data.type === "response.completed") {
+			if (!content && isRecord(data.response)) content = extractResponsesFinalText(data.response);
+			return true;
+		}
+		return false;
+	};
+
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
@@ -2609,26 +2634,14 @@ async function parseSearchStreamResponse(
 			buffer = lines.pop() || "";
 
 			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				rawLines.push(trimmed);
-				if (!trimmed.startsWith("data:")) continue;
-				if (trimmed === "data: [DONE]" || trimmed === "data:[DONE]") continue;
-
-				try {
-					const data = JSON.parse(trimmed.slice(5).trim()) as Record<string, unknown>;
-					const chunk = protocol === "responses"
-						? extractResponsesDeltaText(data)
-						: extractCompletionsDeltaText(data);
-					if (chunk) content += chunk;
-				} catch {
-					// skip malformed chunks
+				if (parseLine(line)) {
+					await reader.cancel();
+					return content;
 				}
 			}
 		}
 
-		const trailing = buffer.trim();
-		if (trailing) rawLines.push(trailing);
+		parseLine(buffer + decoder.decode());
 	} finally {
 		reader.releaseLock();
 	}
@@ -2683,6 +2696,7 @@ interface DocsSearchOptions {
 	libraryId?: string;
 	maxResults?: number;
 	maxOutputBytes?: number;
+	forceRefresh?: boolean;
 }
 
 function shouldUseDocsSearch(profile: SearchProfile, query: string): boolean {
@@ -2759,14 +2773,6 @@ async function context7DocsRaw(
 	} catch {
 		return { content: body };
 	}
-}
-
-async function context7Docs(
-	libraryId: string,
-	query: string,
-	signal?: AbortSignal,
-): Promise<unknown[]> {
-	return context7SnippetsFromData(await context7DocsRaw(libraryId, query, signal));
 }
 
 function context7LibraryUrl(baseUrl: string, id: string | undefined): string {
@@ -2885,33 +2891,16 @@ async function docsSearchSources(
 	attempts: ProviderAttempt[],
 ): Promise<Source[]> {
 	const config = await configManager.getFullConfig();
-	const sources: Source[] = [];
-	try {
-		const libraries = await withProviderAttempt(
-			attempts,
-			"docs_search",
-			"context7",
-			() => context7LibrarySearch(query, maxResults, signal),
-		);
-		sources.push(...context7LibrarySources(libraries, config.context7BaseUrl));
-	} catch (e) {
-		if (e instanceof Error && e.name === "AbortError") throw e;
-	}
-
+	const tasks: Promise<Source[]>[] = [
+		getContext7LibrariesCached(query, maxResults, false, signal, attempts)
+			.then(({ libraries }) => context7LibrarySources(libraries, config.context7BaseUrl)),
+	];
 	if (config.exaApiKey && config.fallbackMode === "auto") {
-		try {
-			const exa = await withProviderAttempt(
-				attempts,
-				"docs_search",
-				"exa",
-				() => exaSearch(query, maxResults, signal),
-			);
-			sources.push(...exaSources(exa));
-		} catch (e) {
-			if (e instanceof Error && e.name === "AbortError") throw e;
-		}
+		tasks.push(withProviderAttempt(attempts, "docs_search", "exa", () => exaSearch(query, maxResults, signal))
+			.then(exaSources));
 	}
-
+	const results = await Promise.allSettled(tasks);
+	const sources = results.flatMap((result) => getSettledValue<Source[]>(result, []));
 	return limitSources(mergeSources(sources), maxResults);
 }
 
@@ -2930,45 +2919,33 @@ async function runDocsSearch(
 	let context7Snippets: unknown[] = [];
 	let exaResults: ExaResultItem[] = [];
 
-	if (provider === "auto" || provider === "context7" || provider === "all") {
-		try {
-			context7Libraries = await withProviderAttempt(
-				attempts,
-				"docs_search",
-				"context7",
-				() => context7LibrarySearch(query, maxResults, signal),
-			);
-			sources.push(...context7LibrarySources(context7Libraries, config.context7BaseUrl));
-			const libraryId = options.libraryId || context7Libraries.find((item) => item.id)?.id;
-			if (libraryId) {
-				context7Snippets = await withProviderAttempt(
-					attempts,
-					"docs_search",
-					"context7_docs",
-					() => context7Docs(libraryId, query, signal),
-				);
-			}
-		} catch (e) {
-			if (e instanceof Error && e.name === "AbortError") throw e;
+	const loadContext7 = async () => {
+		if (provider === "exa") return;
+		if (!options.libraryId) {
+			const resolved = await getContext7LibrariesCached(query, maxResults, !!options.forceRefresh, signal, attempts);
+			context7Libraries = resolved.libraries;
 		}
-	}
-
-	const shouldRunExa =
-		!!config.exaApiKey &&
-		(provider === "exa" || provider === "all" || (provider === "auto" && (config.fallbackMode === "auto" || sources.length === 0)));
-	if (shouldRunExa) {
-		try {
-			exaResults = await withProviderAttempt(
-				attempts,
-				"docs_search",
-				"exa",
-				() => exaSearch(query, maxResults, signal),
-			);
-			sources.push(...exaSources(exaResults));
-		} catch (e) {
-			if (e instanceof Error && e.name === "AbortError") throw e;
+		const libraryId = options.libraryId || context7Libraries.find((item) => item.id)?.id;
+		if (libraryId) {
+			const docs = await getContext7DocsCached(libraryId, query, !!options.forceRefresh, signal, attempts);
+			context7Snippets = docs.entry.snippets;
 		}
+	};
+	const loadExa = async () => {
+		exaResults = await withProviderAttempt(attempts, "docs_search", "exa", () => exaSearch(query, maxResults, signal));
+	};
+	const parallelExa = !!config.exaApiKey &&
+		(provider === "exa" || provider === "all" || (provider === "auto" && config.fallbackMode === "auto"));
+	await Promise.allSettled([loadContext7(), ...(parallelExa ? [loadExa()] : [])]);
+	if (!parallelExa && config.exaApiKey && provider === "auto" && context7Libraries.length === 0 && context7Snippets.length === 0) {
+		await Promise.allSettled([loadExa()]);
 	}
+	signal?.throwIfAborted();
+	sources.push(
+		...context7LibrarySources(context7Libraries, config.context7BaseUrl),
+		...(options.libraryId && context7Snippets.length > 0 ? [{ url: context7LibraryUrl(config.context7BaseUrl, options.libraryId), provider: "context7" }] : []),
+		...exaSources(exaResults),
+	);
 
 	if (context7Libraries.length > 0) {
 		sections.push("\n### Context7 libraries");
@@ -4227,9 +4204,16 @@ export default function (pi: ExtensionAPI) {
 						"可选思考等级，仅本次请求生效。留空使用全局配置（/search-config 或 /search-model 设置）。off 不发送 reasoning_effort。",
 				}),
 			),
+			timeout_ms: Type.Optional(Type.Number({ description: "整次搜索的超时预算（毫秒），默认 120000。", minimum: 1, maximum: 1800000 })),
+			enrichment_timeout_ms: Type.Optional(Type.Number({ description: "补充信源的超时预算（毫秒），默认 8000；超时保留已完成结果。", minimum: 1, maximum: 1800000 })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const startedAt = performance.now();
+			const timeoutMs = clampNumber(params.timeout_ms, normalizePositiveNumber(process.env.SEARCH_TIMEOUT_MS, undefined, DEFAULT_REQUEST_TIMEOUT_MS), 1, 1_800_000);
+			const enrichmentTimeoutMs = Math.min(timeoutMs, clampNumber(params.enrichment_timeout_ms, normalizePositiveNumber(process.env.SEARCH_ENRICHMENT_TIMEOUT_MS, undefined, DEFAULT_ENRICHMENT_TIMEOUT_MS), 1, 1_800_000));
+			const searchSignal = createTimeoutSignal(timeoutMs, signal);
+			const enrichmentSignal = createTimeoutSignal(enrichmentTimeoutMs, searchSignal);
 			const config = await configManager.getFullConfig();
 			const effectiveModel = normalizeSearchModel(params.model || config.searchModel, config.searchApiUrl);
 			const thinkingLevel = parseThinkingLevel(params.thinking_level) || config.thinkingLevel;
@@ -4246,17 +4230,6 @@ export default function (pi: ExtensionAPI) {
 				const hasFirecrawl = !!config.firecrawlApiKey;
 				const extraBudget = splitExtraSourceBudget(params.extra_sources || 0, hasTavily, hasFirecrawl);
 
-				if (params.model && config.searchApiUrl && config.searchApiKey) {
-					const models = await getAvailableModelsCached(
-						config.searchApiUrl,
-						config.searchApiKey,
-						signal,
-					);
-					if (models.length > 0 && !models.includes(effectiveModel)) {
-						throw new Error(`无效模型: ${effectiveModel}`);
-					}
-				}
-
 				const attempts: ProviderAttempt[] = [];
 				const tasks: Promise<unknown>[] = [
 					withProviderAttempt(
@@ -4266,7 +4239,7 @@ export default function (pi: ExtensionAPI) {
 						() => searchWithModel(
 							params.query,
 							params.platform || "",
-							signal,
+							searchSignal,
 							effectiveModel,
 							controls,
 							profile,
@@ -4281,7 +4254,7 @@ export default function (pi: ExtensionAPI) {
 						"web_search",
 						"tavily",
 						async () => {
-							const sources = await tavilySearch(params.query, extraBudget.tavily, signal);
+							const sources = await tavilySearch(params.query, extraBudget.tavily, enrichmentSignal);
 							return sources.length > 0 ? sources : null;
 						},
 					));
@@ -4292,17 +4265,18 @@ export default function (pi: ExtensionAPI) {
 						"web_search",
 						"firecrawl",
 						async () => {
-							const sources = await firecrawlSearch(params.query, extraBudget.firecrawl, signal);
+							const sources = await firecrawlSearch(params.query, extraBudget.firecrawl, enrichmentSignal);
 							return sources.length > 0 ? sources : null;
 						},
 					));
 				}
 				const docsSearchEnabled = controls.maxSources > 0 && config.fallbackMode === "auto" && shouldUseDocsSearch(profile, params.query);
 				if (docsSearchEnabled) {
-					tasks.push(docsSearchSources(params.query, Math.min(controls.maxSources || 6, 8), signal, attempts));
+					tasks.push(docsSearchSources(params.query, Math.min(controls.maxSources || 6, 8), enrichmentSignal, attempts));
 				}
 
 				const results = await Promise.allSettled(tasks);
+				signal?.throwIfAborted();
 
 				if (results[0]?.status === "rejected") {
 					if (results.length === 1) throw results[0].reason;
@@ -4330,6 +4304,8 @@ export default function (pi: ExtensionAPI) {
 					splitAnswerAndSources(primaryResult);
 				const extraSources = mergeSources(docsSources, tavilySources, firecrawlSources);
 				const allSources = mergeSources(primarySources, extraSources);
+				if (!primaryResult && allSources.length === 0 && results[0]?.status === "rejected") throw results[0].reason;
+				const partialSuccess = attempts.some((attempt) => !attempt.ok) && !!(primaryResult || allSources.length);
 
 				// Cache sources and expose paging only after a session actually has sources.
 				sourcesCache.set(sessionId, allSources);
@@ -4372,6 +4348,10 @@ export default function (pi: ExtensionAPI) {
 						model: effectiveModel,
 						api_protocol: config.searchApiProtocol,
 						thinking_level: thinkingLevel,
+						latency_ms: Math.round(performance.now() - startedAt),
+						timeout_ms: timeoutMs,
+						enrichment_timeout_ms: enrichmentTimeoutMs,
+						partial_success: partialSuccess,
 						docs_search_enriched: docsSources.length > 0,
 						routing_decision: {
 							main_search: "openai_compatible",
@@ -4721,7 +4701,8 @@ export default function (pi: ExtensionAPI) {
 					description: "provider 选择。auto 默认 Context7，配置 Exa 且允许 fallback 时补充 Exa。",
 				}),
 			),
-			library_id: Type.Optional(Type.String({ description: "Context7 libraryId；留空时自动使用首个库结果" })),
+			library_id: Type.Optional(Type.String({ description: "Context7 libraryId；提供后跳过库解析，否则自动使用首个库结果" })),
+			force_refresh: Type.Optional(Type.Boolean({ description: "跳过 Context7 缓存，强制请求最新文档" })),
 			max_results: Type.Optional(Type.Number({ description: "最大结果数（1-20），默认 6", minimum: 1, maximum: 20 })),
 			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
 		}),
@@ -4738,6 +4719,7 @@ export default function (pi: ExtensionAPI) {
 						libraryId: params.library_id,
 						maxResults: params.max_results,
 						maxOutputBytes: params.max_output_bytes,
+						forceRefresh: params.force_refresh,
 					},
 					signal,
 				);

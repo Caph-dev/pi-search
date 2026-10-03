@@ -74,6 +74,8 @@ export SEARCH_API_KEY="your-api-key"
 export SEARCH_API_PROTOCOL="completions"  # completions | responses（openai-completions / openai-responses）
 export SEARCH_MODEL="your-search-model"
 export SEARCH_THINKING_LEVEL="off"  # off | minimal | low | medium | high | xhigh | max
+export SEARCH_TIMEOUT_MS="120000"  # 整次搜索预算，包含重试和响应读取
+export SEARCH_ENRICHMENT_TIMEOUT_MS="8000" # 补充信源预算，与主搜索同时开始
 
 # Context7（可选 API Key；默认 base URL 可公开访问时用于 docs_search/context7_*）
 export CONTEXT7_BASE_URL="https://context7.com"
@@ -244,6 +246,9 @@ Context7 缓存行为：
 - `provider=context7`：只查 Context7 library/docs
 - `provider=exa`：只查 Exa
 - `provider=all`：Context7 + Exa 都查
+- 两个 provider 需要同时查询时并行执行，结果仍按 Context7 → Exa 排列
+- Context7 库解析和文档复用现有 TTL 缓存；`force_refresh: true` 强制刷新
+- 提供 `library_id` 时跳过库解析，直接查文档
 
 ### `web_fetch` + smart_direct
 
@@ -321,6 +326,27 @@ Context7 缓存行为：
   "max_output_bytes": 12000
 }
 ```
+
+### 搜索速度与超时
+
+参考 [smartsearch](https://github.com/konbakuyomu/smartsearch) 的共享时间预算，`search` 将主搜索和补充信源并行执行：
+
+- 整次搜索默认最多 120 秒，可用 `timeout_ms` 或 `SEARCH_TIMEOUT_MS` 调整。
+- Context7、Exa、Tavily、Firecrawl 补充信源默认最多 8 秒，与主搜索同时开始；可用 `enrichment_timeout_ms` 或 `SEARCH_ENRICHMENT_TIMEOUT_MS` 调整，且不超过整次搜索预算。较慢的补充结果可能被省略；显式 `docs_search` 不受这 8 秒限制。
+- 补充请求超时保留已完成 provider 的结果，`details.partial_success` 标明是否存在失败请求；取消和超时会立即停止重试等待。
+- 临时指定 `model` 直接发搜索请求，模型有效性由 API 判断；模型列表仍用于交互式选模型。
+- 流式响应收到 `[DONE]` 或 Responses `response.completed` 后立即结束读取，无需等待连接关闭。
+- `details.latency_ms` 返回整次调用耗时；`provider_attempts` 保留各 provider 耗时。搜索答案始终实时请求，未新增答案缓存。
+
+验证和本地模拟测速：
+
+```bash
+npm test
+npm run typecheck
+npm run bench
+```
+
+测速使用固定延迟的模拟 provider，不调用收费 API，不代表真实网络或模型服务的加速比例。
 
 ### Offline research_plan
 

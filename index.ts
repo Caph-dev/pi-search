@@ -2837,12 +2837,14 @@ function context7LibrarySources(items: Context7LibraryItem[], baseUrl: string): 
 	}));
 }
 
+const CONTEXT7_SNIPPET_MAX_CHARS = 3000;
+
 function formatContext7Snippet(snippet: unknown): string {
-	if (typeof snippet === "string") return snippet.slice(0, 800);
-	if (!isRecord(snippet)) return JSON.stringify(snippet).slice(0, 800);
+	if (typeof snippet === "string") return snippet.slice(0, CONTEXT7_SNIPPET_MAX_CHARS);
+	if (!isRecord(snippet)) return JSON.stringify(snippet).slice(0, CONTEXT7_SNIPPET_MAX_CHARS);
 	const title = firstString(snippet, ["title", "name", "filePath"]);
 	const content = firstString(snippet, ["content", "text", "description", "code"]);
-	return [title ? `**${title}**` : "", content || JSON.stringify(snippet)].filter(Boolean).join("\n").slice(0, 1200);
+	return [title ? `**${title}**` : "", content || JSON.stringify(snippet)].filter(Boolean).join("\n").slice(0, CONTEXT7_SNIPPET_MAX_CHARS);
 }
 
 async function exaSearch(
@@ -4704,7 +4706,7 @@ export default function (pi: ExtensionAPI) {
 			library_id: Type.Optional(Type.String({ description: "Context7 libraryId；提供后跳过库解析，否则自动使用首个库结果" })),
 			force_refresh: Type.Optional(Type.Boolean({ description: "跳过 Context7 缓存，强制请求最新文档" })),
 			max_results: Type.Optional(Type.Number({ description: "最大结果数（1-20），默认 6", minimum: 1, maximum: 20 })),
-			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 20000", minimum: 3000, maximum: 51200 })),
 		}),
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -4734,8 +4736,13 @@ export default function (pi: ExtensionAPI) {
 						output += `- ... 还有 ${result.sources.length - visibleSources.length} 个信源，使用 search_sources 分页获取\n`;
 					}
 				}
+				const docsMaxBytes = clampNumber(params.max_output_bytes, 20000, 3000, 50 * 1024);
+				// AUTO_FOLD_BYTES (8KB) / AUTO_FOLD_LINES (180) would fold the preview before the byte
+				// budget is spent, so the model-facing preview is bound to maxBytes instead.
 				const rendered = await truncateToolOutput(output, "docs-search", {
-					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+					maxBytes: docsMaxBytes,
+					foldBytes: docsMaxBytes,
+					foldLines: 400,
 				});
 				const { content, ...outputDetails } = rendered;
 				return {
